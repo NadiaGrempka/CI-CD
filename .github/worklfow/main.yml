@@ -1,0 +1,416 @@
+name: "CI/CD Pipeline (Node.js + PostgreSQL + Redis)"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Środowisko docelowe (staging/production)"no
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  NODE_VERSION: 18
+  CACHE_VERSION: "v1"
+
+jobs:
+  ################################################
+  # 1. Faza wstępna (równoległe: lint, audit, format)
+  ################################################
+
+  lint:
+    name: Lint (ESLint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: "${{ env.NODE_VERSION }}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+  audit:
+    name: Security Audit (npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: "${{ env.NODE_VERSION }}"
+
+      - name: Cache npm
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-audit-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-audit-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit (poziom moderate)
+        run: npm audit --audit-level=moderate
+
+  format:
+    name: Check Formatting (Prettier)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: "${{ env.NODE_VERSION }}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check Prettier formatting
+        run: npm run format
+
+  ################################################################
+  # 2. Testy jednostkowe w matrixie (różne wersje Node.js + cache)
+  ################################################################
+
+  unit_tests:
+    name: Unit Tests (Node.js matrix)
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - audit
+      - format
+    strategy:
+      matrix:
+        node-version: [16, 18, 20]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: "${{ matrix.node-version }}"
+
+      - name: Cache npm
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-
+
+      - name: Install dependencies
+        id: npm_install
+        continue-on-error: true
+        run: npm ci
+
+      - name: Upload npm debug log (jeśli npm ci się nie powiódł)
+        if: steps.npm_install.outcome == 'failure'
+        run: |
+          echo "---- Lista plików w katalogu ~/.npm/_logs ----"
+          ls ~/.npm/_logs/ || true
+          echo "---- Zawartość wszystkich .log w ~/.npm/_logs ----"
+          cat ~/.npm/_logs/*.log || true
+
+      - name: Publish npm logs as artifact
+        if: steps.npm_install.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-debug-logs-${{ matrix.node-version }}
+          path: ~/.npm/_logs/*.log
+
+      - name: Fail the job if npm ci failed
+        if: steps.npm_install.outcome == 'failure'
+        run: exit 1
+
+      - name: Run Node.js Unit Tests
+        if: steps.npm_install.outcome == 'success'
+        run: npm run test:unit
+
+      - name: Upload unit coverage report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-coverage-${{ matrix.node-version }}
+          path: coverage/unit
+
+      - name: Publish coverage to Codecov
+        if: success()
+        uses: codecov/codecov-action@v3
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: coverage/unit/**/*.info
+          flags: unit-${{ matrix.node-version }}
+
+  ###########################################################################
+  # 3. Testy uruchamiane we własnym kontenerze Docker (tylko unit-testy)
+  ###########################################################################
+
+  container_tests:
+    name: Tests in Docker Container (Unit only)
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - audit
+      - format
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Build Docker image for tests
+        run: |
+          docker build \
+            --tag ci-node-postgres-redis:${{ github.sha }} \
+            --file Dockerfile .
+
+      - name: Create local npm cache volume directory
+        run: mkdir -p ${{ runner.temp }}/npm-cache
+
+      - name: Run unit tests inside Docker (z ograniczeniami zasobów)
+        run: |
+          docker run --rm \
+            --cpus=2 --memory=4g \
+            -v ${{ github.workspace }}:/usr/src/app \
+            -v ${{ runner.temp }}/npm-cache:/root/.npm \
+            -w /usr/src/app \
+            ci-node-postgres-redis:${{ github.sha }} \
+            bash -c "npm ci && npm run test:unit"
+
+      - name: Upload Docker-based unit coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-unit-coverage
+          path: coverage/unit
+
+      - name: Publish container-based coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v3
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: coverage/unit/**/*.info
+          flags: container-unit
+
+  ####################################################
+  # 4. Testy integracyjne z `services:` (Postgres + Redis)
+  ####################################################
+
+  integration_tests:
+    name: Integration Tests (PostgreSQL + Redis)
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - audit
+      - format
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: myappdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+      redis:
+        image: redis:6-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: "${{ env.NODE_VERSION }}"
+
+      - name: Cache npm
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -U postgres && break
+            echo "Czekam na PostgreSQL..."
+            sleep 1
+          done
+
+      - name: Wait for Redis
+        run: |
+          for i in {1..30}; do
+            redis-cli -h localhost ping | grep PONG && break
+            echo "Czekam na Redis..."
+            sleep 1
+          done
+
+      - name: Set env for integration tests
+        run: |
+          echo "DATABASE_URL=postgres://postgres:secret@localhost:5432/myappdb" >> $GITHUB_ENV
+          echo "REDIS_URL=redis://localhost:6379" >> $GITHUB_ENV
+          echo "NODE_ENV=test" >> $GITHUB_ENV
+
+      - name: Run Integration Tests
+        run: npm run test:integration
+
+      - name: Check integration coverage directory
+        run: |
+          echo "### Zawartość folderu coverage/integration ###"
+          ls -R coverage/integration || echo "Brak katalogu coverage/integration"
+
+      - name: Upload integration coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-coverage
+          path: coverage/integration
+          if-no-files-found: ignore
+
+      - name: Publish integration coverage to Codecov
+        if: success()
+        uses: codecov/codecov-action@v3
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: coverage/integration/**/*.info
+          flags: integration
+
+  ###########################################
+  # 5. Budowanie obrazu produkcyjnego Docker #
+  ###########################################
+
+  build:
+    name: Build & Publish Docker Image
+    runs-on: ubuntu-latest
+    needs:
+      - integration_tests
+      - unit_tests
+      - container_tests
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU (dla wieloarchitekturowego builda)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx (opcjonalnie)
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          load: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/lab14:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/lab14:latest
+
+      - name: Save Docker image to tar (opcjonalnie)
+        run: docker save ${{ secrets.DOCKERHUB_USERNAME }}/lab14:${{ github.sha }} -o image.tar
+
+      - name: Upload Docker image as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: image.tar
+
+  ##############################################
+  # 6. Deployment (symulowany) – tylko na main  #
+  ##############################################
+
+  deploy:
+    name: Deploy (symulowany)
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Symulacja pobrania artefaktu obrazu
+        run: echo ">>> [Symulacja deploy] Pobieram artefakt obrazu Docker (tylko echo)."
+
+      - name: Symulacja ładowania obrazu
+        run: echo ">>> [Symulacja deploy] Ładuję obraz Docker (tylko echo)."
+
+      - name: Run Custom Deploy Action (symulacja)
+        id: custom_deploy
+        uses: ./.github/actions
+        with:
+          environment: ${{ github.event.inputs.environment || 'staging' }}
+          version: ${{ github.sha }}
+          notify-team: "true"
+
+      - name: Wyświetl symulowane informacje o wdrożeniu
+        run: |
+          echo ">>> [Symulacja deploy] Deployment URL: ${{ steps.custom_deploy.outputs.deployment-url }}"
+          echo ">>> [Symulacja deploy] Deployment Time: ${{ steps.custom_deploy.outputs.deployment-time }}"
+
+      - name: Notify on Deployment Failure (tylko symulacja komentarza)
+        if: failure()
+        run: echo ">>> [Symulacja deploy] Wystąpił błąd w symulowanym wdrożeniu – (tylko echo, brak rzeczywistej akcji)."
+
+  ###################################################
+  # 7. Develop action – tylko na gałęzi develop      #
+  ###################################################
+
+  develop_action:
+    name: Develop action
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/develop' }}
+    steps:
+      - name: Hello on develop
+        run: echo "Hello on develop"
