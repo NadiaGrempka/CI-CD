@@ -6,7 +6,7 @@ on:
       - main
 
 env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/nazwa-aplikacji
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ci-cd
 
 jobs:
 
